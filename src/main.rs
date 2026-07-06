@@ -4,17 +4,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::Context;
+use anyhow::{Context, Result};
 use clap::Parser;
 use ignore::WalkBuilder;
 
 const UNKNOWN_NAME: &str = "unknown";
 
 #[derive(Parser, Debug)]
-#[command(about = "Дампит файлы из директории в один markdown файл")]
+#[command(about = "Дампит файлы из директории в один Markdown-файл")]
 struct Args {
-    #[arg(default_value = ".", help = "Директория для сканирования")]
-    input: PathBuf,
+    #[arg(default_value = ".", help = "Директории для сканирования")]
+    input: Vec<PathBuf>,
+
     #[arg(
         short,
         long,
@@ -24,7 +25,7 @@ struct Args {
     output: PathBuf,
 }
 
-fn walk_source_files(root: &Path) -> impl Iterator<Item = PathBuf> {
+fn walk_source_files(root: &Path) -> impl Iterator<Item = PathBuf> + '_ {
     WalkBuilder::new(root)
         .build()
         .filter_map(|res| {
@@ -45,7 +46,7 @@ fn display_name<'a>(path: &'a Path, root: &Path) -> &'a str {
         .unwrap_or(UNKNOWN_NAME)
 }
 
-fn write_dump<I>(files: I, output_path: &Path, root: &Path) -> anyhow::Result<()>
+fn write_dump<I>(files: I, output_path: &Path, root: &Path) -> Result<()>
 where
     I: IntoIterator<Item = PathBuf>,
 {
@@ -71,30 +72,35 @@ where
         write!(writer, "### {}\n```\n", name)?;
 
         if let Err(e) = std::io::copy(&mut reader, &mut writer) {
-            eprintln!("Ошибка при копировании {:?}: {}", path, e);
+            eprintln!("Предупреждение: ошибка при копировании {:?}: {}", path, e);
         }
 
-        writer.write_all(b"\n```\n\n")?;
+        write!(writer, "\n```\n\n")?;
     }
 
-    let _ = writer.flush().context("Не удалось очистить буфер записи");
+    writer.flush().context("Не удалось очистить буфер записи")?;
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<()> {
     let args = Args::parse();
 
-    let input_path = std::fs::canonicalize(&args.input).with_context(|| format!("Входная директория не найдена: {:?}", args.input))?;
-
+    let cwd = std::env::current_dir().context("Не удалось получить текущую директорию")?;
     let output_path = if args.output.is_relative() {
-        std::env::current_dir()?.join(&args.output)
+        cwd.join(&args.output)
     } else {
         args.output.clone()
     };
 
-    let files = walk_source_files(&input_path);
+    let mut files = Vec::new();
+    for input in &args.input {
+        let input_path = std::fs::canonicalize(input)
+            .with_context(|| format!("Входная директория не найдена: {:?}", input))?;
 
-    write_dump(files, &output_path, &input_path).context("Не удалось записать дамп")?;
+        files.extend(walk_source_files(&input_path));
+    }
+
+    write_dump(files, &output_path, &cwd).context("Не удалось записать дамп")?;
 
     println!("Файлы записаны в {:?}", args.output);
     Ok(())
