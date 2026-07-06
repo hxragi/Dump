@@ -4,32 +4,56 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use anyhow::Context;
 use clap::Parser;
 use ignore::WalkBuilder;
 
+const UNKNOWN_NAME: &str = "unknown";
+
 #[derive(Parser, Debug)]
+#[command(about = "Дампит файлы из директории в один markdown файл")]
 struct Args {
-    #[arg(default_value = ".")]
+    #[arg(default_value = ".", help = "Директория для сканирования")]
     input: PathBuf,
-    #[arg(short, long, default_value = "dump.md")]
+    #[arg(
+        short,
+        long,
+        default_value = "dump.md",
+        help = "Путь к файлу результата"
+    )]
     output: PathBuf,
 }
 
-fn get_files(path: &Path) -> impl Iterator<Item = ignore::DirEntry> {
-    WalkBuilder::new(path)
+fn walk_source_files(root: &Path) -> impl Iterator<Item = PathBuf> {
+    WalkBuilder::new(root)
         .build()
-        .filter_map(|res| res.ok())
+        .filter_map(|res| {
+            if let Err(e) = &res {
+                eprintln!("Предупреждение: пропуск записи при обходе: {}", e);
+            }
+            res.ok()
+        })
         .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
+        .map(|entry| entry.into_path())
 }
 
-fn write_to_dump<I>(paths: I, output_path: &Path) -> std::io::Result<()>
+fn display_name<'a>(path: &'a Path, root: &Path) -> &'a str {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|p| p.to_str())
+        .or_else(|| path.to_str())
+        .unwrap_or(UNKNOWN_NAME)
+}
+
+fn write_dump<I>(files: I, output_path: &Path, root: &Path) -> anyhow::Result<()>
 where
     I: IntoIterator<Item = PathBuf>,
 {
-    let file = FsFile::create(output_path)?;
+    let file = FsFile::create(output_path)
+        .with_context(|| format!("Не удалось создать файл дампа: {:?}", output_path))?;
     let mut writer = BufWriter::new(file);
 
-    for path in paths {
+    for path in files {
         if path == output_path {
             continue;
         }
@@ -37,16 +61,14 @@ where
         let mut reader = match FsFile::open(&path) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("Критическая ошибка чтения {:?}: {}", path, e);
+                eprintln!("Предупреждение: не удалось открыть {:?}: {}", path, e);
                 continue;
             }
         };
 
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-        writer.write_all(format!("### {}\n```\n", name).as_bytes())?;
+        let name = display_name(&path, root);
+
+        write!(writer, "### {}\n```\n", name)?;
 
         if let Err(e) = std::io::copy(&mut reader, &mut writer) {
             eprintln!("Ошибка при копировании {:?}: {}", path, e);
@@ -55,24 +77,24 @@ where
         writer.write_all(b"\n```\n\n")?;
     }
 
-    writer.flush()?;
+    let _ = writer.flush().context("Не удалось очистить буфер записи");
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let input_path = std::fs::canonicalize(&args.input)?;
+    let input_path = std::fs::canonicalize(&args.input).with_context(|| format!("Входная директория не найдена: {:?}", args.input))?;
 
-    let mut output_path = args.output.clone();
-    if output_path.is_relative() {
-        if let Ok(cwd) = std::env::current_dir() {
-            output_path = cwd.join(&output_path)
-        }
-    }
+    let output_path = if args.output.is_relative() {
+        std::env::current_dir()?.join(&args.output)
+    } else {
+        args.output.clone()
+    };
 
-    let paths = get_files(&input_path).map(|entry| entry.into_path());
-    let _ = write_to_dump(paths, &output_path);
+    let files = walk_source_files(&input_path);
+
+    write_dump(files, &output_path, &input_path).context("Не удалось записать дамп")?;
 
     println!("Файлы записаны в {:?}", args.output);
     Ok(())
